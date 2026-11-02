@@ -1,5 +1,10 @@
 # TrainingPeaks MCP Server
 
+> **This fork:** native Streamable HTTP container for Docker Swarm, built and
+> published by GitHub Actions for amd64 and arm64. See [Docker deployment](docker/README.md).
+> Live TrainingPeaks access is disabled by default; no stdio transport is used
+> by the container.
+
 <a href="https://glama.ai/mcp/servers/@JamsusMaximus/TrainingPeaks-MCP">
   <img width="380" height="200" src="https://glama.ai/mcp/servers/@JamsusMaximus/TrainingPeaks-MCP/badge" alt="TrainingPeaks MCP server" />
 </a>
