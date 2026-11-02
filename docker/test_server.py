@@ -1,6 +1,8 @@
 import json
 import os
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from mcp.types import CallToolRequestParams, TextContent
@@ -42,10 +44,54 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             result = await server.call_tool(None, CallToolRequestParams(name="tp_get_profile"))
             self.assertTrue(result.is_error)
 
+    async def test_live_readonly_blocks_mutations_even_when_called_directly(self):
+        with (
+            patch.dict(os.environ, {"TP_LIVE_ENABLED": "true", "TP_READ_ONLY": "true"}),
+            patch.object(server.upstream, "call_tool", new_callable=AsyncMock) as call,
+        ):
+            for name in ("tp_create_workout", "tp_delete_workout", "tp_update_ftp"):
+                result = await server.call_tool(None, CallToolRequestParams(name=name))
+                self.assertTrue(result.is_error)
+                self.assertEqual(json.loads(result.content[0].text)["error_code"], "READ_ONLY")
+            call.assert_not_awaited()
+
+    async def test_readonly_discovery_contains_only_read_tools(self):
+        with patch.dict(os.environ, {"TP_READ_ONLY": "true"}):
+            tools = (await server.list_tools(None, None)).tools
+            self.assertTrue(all(tool.annotations.read_only_hint for tool in tools))
+            self.assertNotIn("tp_create_workout", [tool.name for tool in tools])
+            self.assertIn("tp_get_workouts", [tool.name for tool in tools])
+
+    async def test_cookie_file_and_empty_cookie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cookie"
+            with patch.dict(
+                os.environ,
+                {"TP_LIVE_ENABLED": "true", "TP_AUTH_COOKIE_FILE": str(path)},
+            ):
+                path.write_text("")
+                with self.assertRaisesRegex(RuntimeError, "empty"):
+                    async with server.lifespan(server.app):
+                        pass
+                path.write_text("test-only-cookie\n")
+                with patch.object(server.manager, "run") as run:
+                    from contextlib import asynccontextmanager
+
+                    @asynccontextmanager
+                    async def mock_run():
+                        yield
+
+                    run.return_value = mock_run()
+                    async with server.lifespan(server.app):
+                        self.assertEqual(os.environ["TP_AUTH_COOKIE"], "test-only-cookie")
+
     def test_invalid_mode_is_rejected(self):
         with patch.dict(os.environ, {"TP_LIVE_ENABLED": "yes"}):
             with self.assertRaises(ValueError):
                 server.live_enabled()
+        with patch.dict(os.environ, {"TP_READ_ONLY": "yes"}):
+            with self.assertRaises(ValueError):
+                server.read_only()
 
 
 class HTTPTests(unittest.TestCase):
