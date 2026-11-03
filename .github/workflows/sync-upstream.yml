@@ -1,0 +1,96 @@
+name: Sync with upstream releases
+
+on:
+  schedule:
+    - cron: "0 * * * *" # Every hour
+  workflow_dispatch:
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    outputs:
+      synced: ${{ steps.sync.outputs.synced }}
+      tag: ${{ steps.check.outputs.upstream_tag }}
+      prerelease: ${{ steps.check.outputs.upstream_prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check upstream release
+        id: check
+        run: |
+          # Get the latest upstream release (including prereleases)
+          LATEST=$(gh api repos/JamsusMaximus/trainingpeaks-mcp/releases --jq '.[0]')
+          UPSTREAM_TAG=$(echo "$LATEST" | jq -r '.tag_name')
+          UPSTREAM_PRERELEASE=$(echo "$LATEST" | jq -r '.prerelease')
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_prerelease=$UPSTREAM_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          # Check if we already have this release synced
+          if git rev-parse "refs/tags/$UPSTREAM_TAG" >/dev/null 2>&1; then
+            echo "already_synced=true" >> "$GITHUB_OUTPUT"
+            echo "Release $UPSTREAM_TAG already synced."
+          else
+            echo "already_synced=false" >> "$GITHUB_OUTPUT"
+            echo "New release detected: $UPSTREAM_TAG (prerelease=$UPSTREAM_PRERELEASE)"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync upstream
+        id: sync
+        if: steps.check.outputs.already_synced == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/JamsusMaximus/trainingpeaks-mcp.git
+          git fetch upstream --tags
+
+          git checkout main
+          git merge upstream/main --no-edit || {
+            echo "::error::Merge conflict detected. Manual resolution required."
+            exit 1
+          }
+
+          git push origin main
+          git tag "${{ steps.check.outputs.upstream_tag }}"
+          git push origin "${{ steps.check.outputs.upstream_tag }}"
+          echo "synced=true" >> "$GITHUB_OUTPUT"
+
+  test-prerelease:
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.synced == 'true' && needs.check-and-sync.outputs.prerelease == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Assert mcp SDK major version (2.x)
+        run: |
+          python -c "from importlib.metadata import version; v = version('mcp'); assert int(v.split('.')[0]) == 2, f'mcp resolved to {v}, expected 2.x - the <2 cap in pyproject.toml is not being enforced'"
+
+      - name: Lint
+        run: ruff check src/
+
+      - name: Type check
+        run: mypy src/
+
+      - name: Run tests
+        run: pytest tests/ -v
