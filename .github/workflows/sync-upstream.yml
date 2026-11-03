@@ -19,6 +19,7 @@ jobs:
       release_prerelease: ${{ steps.check.outputs.release_prerelease }}
       release_sha: ${{ steps.check.outputs.release_sha }}
       base_sha: ${{ steps.check.outputs.base_sha }}
+      conflict: ${{ steps.check.outputs.conflict }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -68,12 +69,28 @@ jobs:
             release_is_merged=false
           fi
 
+          handled=false
+          if git ls-remote --exit-code --tags origin "refs/tags/upstream-handled/$release_tag" >/dev/null 2>&1; then
+            handled=true
+          fi
+
+          conflict=false
           if [[ "$release_is_merged" == true && "$tag_is_synced" == true ]]; then
             needs_sync=false
             echo "Upstream release $release_tag and its tag are already synced."
+          elif [[ "$handled" == true && "$release_is_merged" == false ]]; then
+            needs_sync=false
+            echo "Upstream release $release_tag was already tested and reported."
           else
             needs_sync=true
             echo "Found upstream release $release_tag (prerelease=$release_prerelease)."
+            git checkout --detach "$base_sha"
+            if ! git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              merge --no-ff --no-edit "$release_sha" >/dev/null 2>&1; then
+              conflict=true
+              echo "Merging $release_tag into main produces conflicts."
+            fi
           fi
 
           {
@@ -83,11 +100,12 @@ jobs:
             echo "release_prerelease=$release_prerelease"
             echo "release_sha=$release_sha"
             echo "base_sha=$base_sha"
+            echo "conflict=$conflict"
           } >> "$GITHUB_OUTPUT"
 
   test-release:
     needs: check-release
-    if: needs.check-release.outputs.needs_sync == 'true'
+    if: needs.check-release.outputs.needs_sync == 'true' && needs.check-release.outputs.conflict != 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -150,15 +168,16 @@ jobs:
 
   sync-release:
     needs: [check-release, test-release]
-    if: needs.check-release.outputs.needs_sync == 'true'
+    if: needs.check-release.outputs.needs_sync == 'true' && needs.check-release.outputs.release_prerelease != 'true' && needs.test-release.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # A PAT is needed to push upstream changes that touch workflow files.
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: fork-sync
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
 
       - name: Merge the tested release into main
         env:
@@ -203,3 +222,86 @@ jobs:
           fi
 
           echo "Synced upstream release $RELEASE_TAG to main."
+
+  report-failure:
+    needs: [check-release, test-release]
+    if: >-
+      always() && needs.check-release.outputs.needs_sync == 'true' &&
+      (needs.check-release.outputs.conflict == 'true' || needs.test-release.result == 'failure')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      RELEASE_TAG: ${{ needs.check-release.outputs.release_tag }}
+      RELEASE_SHA: ${{ needs.check-release.outputs.release_sha }}
+      BASE_SHA: ${{ needs.check-release.outputs.base_sha }}
+      PRERELEASE: ${{ needs.check-release.outputs.release_prerelease }}
+      CONFLICT: ${{ needs.check-release.outputs.conflict }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Open an issue and record the release as handled
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/JamsusMaximus/trainingpeaks-mcp.git
+          git fetch --no-tags upstream "refs/tags/$RELEASE_TAG:refs/upstream-tags/$RELEASE_TAG"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          release_url="https://github.com/JamsusMaximus/trainingpeaks-mcp/releases/tag/$RELEASE_TAG"
+
+          if [[ "$CONFLICT" == true ]]; then
+            reason="Merging it into \`main\` produces **conflicts**."
+          else
+            reason="The test suite fails on \`main\` merged with it: $run_url"
+          fi
+
+          if [[ "$PRERELEASE" == true ]]; then
+            title="Upstream prerelease $RELEASE_TAG breaks the fork"
+            todo="Prereleases are tested but never merged. The next stable release will likely need the same fix."
+          else
+            branch="sync/upstream-$RELEASE_TAG"
+            git checkout -b "$branch" "$BASE_SHA"
+            if ! git merge --no-ff -m "Sync upstream $RELEASE_TAG" "$RELEASE_SHA"; then
+              git add -A
+              git commit -qm "Sync upstream $RELEASE_TAG (conflicts to resolve)"
+            fi
+            git push --force origin "$branch"
+            title="Upstream release $RELEASE_TAG cannot be merged"
+            todo="Fix it on the branch \`$branch\` (already pushed), then open a PR to \`main\`."
+          fi
+
+          body="Upstream [$RELEASE_TAG]($release_url) is not compatible with the fork. $reason $todo"
+          existing=$(gh issue list --state all --search "\"$title\" in:title" --json title --jq "map(select(.title == \"$title\")) | length")
+          if [[ "$existing" == 0 ]]; then
+            # Assigning Copilot lets it propose a fix as a PR; the issue is still created if that fails.
+            gh issue create --title "$title" --body "$body" --assignee copilot \
+              || gh issue create --title "$title" --body "$body"
+          fi
+
+          git tag "upstream-handled/$RELEASE_TAG" "$BASE_SHA"
+          git push origin "refs/tags/upstream-handled/$RELEASE_TAG"
+
+  record-prerelease:
+    needs: [check-release, test-release]
+    if: needs.check-release.outputs.needs_sync == 'true' && needs.check-release.outputs.release_prerelease == 'true' && needs.test-release.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record the tested prerelease
+        env:
+          RELEASE_TAG: ${{ needs.check-release.outputs.release_tag }}
+          BASE_SHA: ${{ needs.check-release.outputs.base_sha }}
+        run: |
+          git tag "upstream-handled/$RELEASE_TAG" "$BASE_SHA"
+          git push origin "refs/tags/upstream-handled/$RELEASE_TAG"
+          echo "Prerelease $RELEASE_TAG passes the tests; it will be merged once it becomes a stable release."
