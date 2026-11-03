@@ -245,6 +245,7 @@ async def tp_get_workouts(
                     "tss_planned": w.tss_planned,
                     "tss_actual": w.tss_actual,
                     "description": w.description,
+                    "start_time_planned": w.start_time_planned,
                 }
                 for w in workouts
             ]
@@ -338,6 +339,7 @@ async def tp_get_workout(workout_id: str) -> dict[str, Any]:
                 "feeling": raw_data.get("feeling"),
                 "new_comment": raw_data.get("newComment"),
                 "has_private_workout_note": raw_data.get("hasPrivateWorkoutNoteForCaller"),
+                "start_time_planned": raw_data.get("startTimePlanned"),
                 "metrics": {
                     "duration_planned": workout.duration_planned,
                     "duration_actual": workout.duration_actual,

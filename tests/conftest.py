@@ -107,6 +107,7 @@ def mock_api_responses():
                 "tssPlanned": 80,
                 "tssActual": 75,
                 "completed": True,
+                "startTimePlanned": "2025-01-08T18:30:00",
             },
             {
                 "workoutId": 1002,
@@ -116,6 +117,7 @@ def mock_api_responses():
                 "totalTimePlanned": 1800,
                 "tssPlanned": 40,
                 "completed": False,
+                "startTimePlanned": "2025-01-09T07:00:00",
             },
         ],
         "workout_detail": {
@@ -134,6 +136,7 @@ def mock_api_responses():
             "if": 0.85,
             "ifPlanned": 0.90,
             "completed": True,
+            "startTimePlanned": "2025-01-08T18:30:00",
         },
         "peaks": [
             {

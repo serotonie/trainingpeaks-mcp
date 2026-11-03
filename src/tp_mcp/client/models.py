@@ -99,6 +99,7 @@ class WorkoutSummary(BaseModel):
     distance_actual: float | None = Field(default=None, alias="distance")
     completed: bool | None = Field(default=None)
     description: str | None = None
+    start_time_planned: str | None = Field(default=None, alias="startTimePlanned")
 
     @property
     def date(self) -> date_type:
@@ -173,6 +174,7 @@ class WorkoutDetail(BaseModel):
     avg_cadence: float | None = Field(default=None, alias="cadenceAverage")
     elevation_gain: float | None = Field(default=None, alias="elevationGain")
     completed: bool | None = Field(default=None)
+    start_time_planned: str | None = Field(default=None, alias="startTimePlanned")
     structure: dict[str, Any] | None = None
 
     @property
