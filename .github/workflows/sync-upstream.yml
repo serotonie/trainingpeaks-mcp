@@ -2,75 +2,128 @@ name: Sync with upstream releases
 
 on:
   schedule:
-    - cron: "0 * * * *" # Every hour
+    - cron: "0 * * * *"
   workflow_dispatch:
 
+concurrency:
+  group: upstream-release-sync
+  cancel-in-progress: false
+
 jobs:
-  check-and-sync:
+  check-release:
     runs-on: ubuntu-latest
     outputs:
-      synced: ${{ steps.sync.outputs.synced }}
-      tag: ${{ steps.check.outputs.upstream_tag }}
-      prerelease: ${{ steps.check.outputs.upstream_prerelease }}
+      release_found: ${{ steps.check.outputs.release_found }}
+      needs_sync: ${{ steps.check.outputs.needs_sync }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      release_prerelease: ${{ steps.check.outputs.release_prerelease }}
+      release_sha: ${{ steps.check.outputs.release_sha }}
+      base_sha: ${{ steps.check.outputs.base_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check upstream release
+      - name: Find the latest upstream release
         id: check
-        run: |
-          # Get the latest upstream release (including prereleases)
-          LATEST=$(gh api repos/JamsusMaximus/trainingpeaks-mcp/releases --jq '.[0]')
-          UPSTREAM_TAG=$(echo "$LATEST" | jq -r '.tag_name')
-          UPSTREAM_PRERELEASE=$(echo "$LATEST" | jq -r '.prerelease')
-
-          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
-          echo "upstream_prerelease=$UPSTREAM_PRERELEASE" >> "$GITHUB_OUTPUT"
-
-          # Check if we already have this release synced
-          if git rev-parse "refs/tags/$UPSTREAM_TAG" >/dev/null 2>&1; then
-            echo "already_synced=true" >> "$GITHUB_OUTPUT"
-            echo "Release $UPSTREAM_TAG already synced."
-          else
-            echo "already_synced=false" >> "$GITHUB_OUTPUT"
-            echo "New release detected: $UPSTREAM_TAG (prerelease=$UPSTREAM_PRERELEASE)"
-          fi
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Sync upstream
-        id: sync
-        if: steps.check.outputs.already_synced == 'false'
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          release=$(gh api "repos/JamsusMaximus/trainingpeaks-mcp/releases?per_page=100" \
+            --jq 'map(select(.draft == false)) | sort_by(.published_at) | last // empty | [.tag_name, (.prerelease | tostring)] | @tsv')
+
+          if [[ -z "$release" ]]; then
+            echo "No published upstream releases found."
+            echo "release_found=false" >> "$GITHUB_OUTPUT"
+            echo "needs_sync=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          IFS=$'\t' read -r release_tag release_prerelease <<< "$release"
+          if ! git check-ref-format "refs/tags/$release_tag"; then
+            echo "::error::Upstream release has an invalid tag name."
+            exit 1
+          fi
 
           git remote add upstream https://github.com/JamsusMaximus/trainingpeaks-mcp.git
-          git fetch upstream --tags
+          git fetch --no-tags upstream "refs/tags/$release_tag:refs/upstream-tags/$release_tag"
+          git fetch origin "refs/heads/main:refs/remotes/origin/main"
 
-          git checkout main
-          git merge upstream/main --no-edit || {
-            echo "::error::Merge conflict detected. Manual resolution required."
-            exit 1
-          }
+          release_sha=$(git rev-parse "refs/upstream-tags/$release_tag^{commit}")
+          base_sha=$(git rev-parse refs/remotes/origin/main)
+          tag_is_synced=false
+          if git ls-remote --exit-code origin "refs/tags/$release_tag" >/dev/null 2>&1; then
+            git fetch --no-tags origin "refs/tags/$release_tag:refs/origin-tags/$release_tag"
+            existing_tag_sha=$(git rev-parse "refs/origin-tags/$release_tag^{commit}")
+            if [[ "$existing_tag_sha" != "$release_sha" ]]; then
+              echo "::error::Fork tag $release_tag exists but points to a different commit."
+              exit 1
+            fi
+            tag_is_synced=true
+          fi
 
-          git push origin main
-          git tag "${{ steps.check.outputs.upstream_tag }}"
-          git push origin "${{ steps.check.outputs.upstream_tag }}"
-          echo "synced=true" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$release_sha" "$base_sha"; then
+            release_is_merged=true
+          else
+            release_is_merged=false
+          fi
 
-  test-prerelease:
-    needs: check-and-sync
-    if: needs.check-and-sync.outputs.synced == 'true' && needs.check-and-sync.outputs.prerelease == 'true'
+          if [[ "$release_is_merged" == true && "$tag_is_synced" == true ]]; then
+            needs_sync=false
+            echo "Upstream release $release_tag and its tag are already synced."
+          else
+            needs_sync=true
+            echo "Found upstream release $release_tag (prerelease=$release_prerelease)."
+          fi
+
+          {
+            echo "release_found=true"
+            echo "needs_sync=$needs_sync"
+            echo "release_tag=$release_tag"
+            echo "release_prerelease=$release_prerelease"
+            echo "release_sha=$release_sha"
+            echo "base_sha=$base_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  test-release:
+    needs: check-release
+    if: needs.check-release.outputs.needs_sync == 'true'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
-
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare the release merge candidate
+        env:
+          BASE_SHA: ${{ needs.check-release.outputs.base_sha }}
+          RELEASE_SHA: ${{ needs.check-release.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.release_tag }}
+        run: |
+          git fetch origin "refs/heads/main:refs/remotes/origin/main"
+          git remote add upstream https://github.com/JamsusMaximus/trainingpeaks-mcp.git
+          git fetch --no-tags upstream "refs/tags/$RELEASE_TAG:refs/upstream-tags/$RELEASE_TAG"
+
+          current_main=$(git rev-parse refs/remotes/origin/main)
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "::error::main changed after release detection; retry on the next schedule."
+            exit 1
+          fi
+
+          fetched_release=$(git rev-parse "refs/upstream-tags/$RELEASE_TAG^{commit}")
+          if [[ "$fetched_release" != "$RELEASE_SHA" ]]; then
+            echo "::error::The upstream release tag changed after detection."
+            exit 1
+          fi
+
+          git checkout --detach "$BASE_SHA"
+          git -c user.name="github-actions[bot]" \
+            -c user.email="github-actions[bot]@users.noreply.github.com" \
+            merge --no-ff --no-edit "$RELEASE_SHA"
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -94,3 +147,59 @@ jobs:
 
       - name: Run tests
         run: pytest tests/ -v
+
+  sync-release:
+    needs: [check-release, test-release]
+    if: needs.check-release.outputs.needs_sync == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fork-sync
+
+      - name: Merge the tested release into main
+        env:
+          BASE_SHA: ${{ needs.check-release.outputs.base_sha }}
+          RELEASE_SHA: ${{ needs.check-release.outputs.release_sha }}
+          RELEASE_TAG: ${{ needs.check-release.outputs.release_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/JamsusMaximus/trainingpeaks-mcp.git
+          git fetch origin "refs/heads/main:refs/remotes/origin/main"
+          git fetch --no-tags upstream "refs/tags/$RELEASE_TAG:refs/upstream-tags/$RELEASE_TAG"
+
+          current_main=$(git rev-parse refs/remotes/origin/main)
+          if [[ "$current_main" != "$BASE_SHA" ]]; then
+            echo "::error::main changed after tests; retry on the next schedule."
+            exit 1
+          fi
+
+          fetched_release=$(git rev-parse "refs/upstream-tags/$RELEASE_TAG^{commit}")
+          if [[ "$fetched_release" != "$RELEASE_SHA" ]]; then
+            echo "::error::The upstream release tag changed after tests."
+            exit 1
+          fi
+
+          git checkout --detach "$BASE_SHA"
+          git merge --no-ff --no-edit "$RELEASE_SHA"
+          candidate_sha=$(git rev-parse HEAD)
+
+          if git ls-remote --exit-code origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/origin-tags/$RELEASE_TAG"
+            existing_tag_sha=$(git rev-parse "refs/origin-tags/$RELEASE_TAG^{commit}")
+            if [[ "$existing_tag_sha" != "$RELEASE_SHA" ]]; then
+              echo "::error::Fork tag $RELEASE_TAG exists but points to a different commit."
+              exit 1
+            fi
+            git push origin "$candidate_sha:refs/heads/main"
+          else
+            git push --atomic origin \
+              "$candidate_sha:refs/heads/main" \
+              "refs/upstream-tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          fi
+
+          echo "Synced upstream release $RELEASE_TAG to main."
